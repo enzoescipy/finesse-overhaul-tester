@@ -25,7 +25,7 @@ The following automated filters were applied to the MTEB leaderboard:
 ### Filtering and Sampling Procedure
 
 - The filtering and shuffling logic is implemented in the `filter_mteb.py` script.
-- The script was executed with the command: `python filter_mteb.py --num-samples 100 --seed 42`.
+- The script was executed with the command: `python filter_mteb.py --num-samples 10000 --seed 42`.
 - The initial filtered list is saved as `filtered_models.csv`.
 
 ## Phase 3: Manual Curation and Verification
@@ -43,10 +43,7 @@ The following automated filters were applied to the MTEB leaderboard:
 
 The following models were excluded during manual curation for the reasons specified:
 
--   `jinaai/jina-embeddings-v2-base-en`: Requires custom LoRA activation, complicating standardized evaluation.
--   `McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-unsup-simcse`: Ambiguous inference procedure makes reproducible evaluation difficult.
--   `McGill-NLP/LLM2Vec-Llama-2-7b-chat-hf-mntp-supervised`: Same reason as above.
--   `McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp-unsup-simcse`: Same reason as above.
+-   `McGill-NLP/LLM2Vec models`: Ambiguous inference procedure makes reproducible evaluation difficult.
 -   `GritLM/GritLM-7B`: Requires custom model loading procedures outside the standard `transformers` pipeline.
 -   `intfloat/e5-mistral-7b-instruct`: While listing a 32,768 token limit, the official model card warns: `"Using this model for inputs longer than 4096 tokens is not recommended."` This makes it unsuitable for our long-context focus.
 -   `Alibaba-NLP/gme-Qwen2-VL-2B-Instruct`: Primarily a Vision-Language model, which is outside the scope of this text-based research.
