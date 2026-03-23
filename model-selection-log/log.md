@@ -53,3 +53,9 @@ The following models were excluded during manual curation for the reasons specif
 
 -   **Final Model Count:** 75
 -   The final, curated list of models is saved as `manually_selected_model.csv`.
+
+### Evaluation Fixage
+
+- All model would be evaluated by the `transformer` python library inference.
+- Pooling method must be one of : `mean pooling`, `cls pooling(first token selection)`, `last token pooling`.
+- If the model recommend to use the custom inference pipeline, base mode will be chosen.
