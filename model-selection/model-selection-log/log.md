@@ -59,3 +59,7 @@ The following models were excluded during manual curation for the reasons specif
 - All model would be evaluated by the `transformer` python library inference.
 - Pooling method must be one of : `mean pooling`, `cls pooling(first token selection)`, `last token pooling`.
 - If the model recommend to use the custom inference pipeline, base mode will be chosen.
+
+### Next Step
+
+See the `/model-investigation-log` folder for detailed next step.
