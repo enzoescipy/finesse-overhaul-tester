@@ -51,7 +51,7 @@ The following models were excluded during manual curation for the reasons specif
 
 ### Final Result
 
--   **Final Model Count:** 75
+-   **Final Model Count:** 74
 -   The final, curated list of models is saved as `manually_selected_model.csv`.
 
 ### Evaluation Fixage

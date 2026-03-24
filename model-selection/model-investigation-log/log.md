@@ -28,5 +28,5 @@
 
 # Final Declare
 
--   **Final Model Count:** 60
+-   **Final Model Count:** 59
 -   The final, curated list of models is saved as `investigation.csv`.
