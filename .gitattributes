@@ -3,3 +3,7 @@ benchmarks/lemb/model_eval_1.zip filter=lfs diff=lfs merge=lfs -text
 benchmarks/lemb/model_eval_2.zip filter=lfs diff=lfs merge=lfs -text
 benchmarks/sffd/model_eval/model_eval_split_0.zip filter=lfs diff=lfs merge=lfs -text
 benchmarks/sffd/model_eval/model_eval_split_1.zip filter=lfs diff=lfs merge=lfs -text
+benchmarks/finesse/model_eval/model_eval_split_0.zip filter=lfs diff=lfs merge=lfs -text
+benchmarks/finesse/model_eval/model_eval_split_1.zip filter=lfs diff=lfs merge=lfs -text
+benchmarks/finesse/model_eval/model_eval_split_2.zip filter=lfs diff=lfs merge=lfs -text
+benchmarks/finesse/model_eval/model_eval_split_3.zip filter=lfs diff=lfs merge=lfs -text
