@@ -206,8 +206,8 @@ class Config:
     DATASETS: List[str] = field(default_factory=lambda: [
                                 "nqa", "mteb_LEMBQMSumRetrieval", "mteb_LEMBSummScreenFDRetrieval"])
 
-    # Mode selection: "E5-SYNTH", "E5-AVERAGE", or "NATIVE_ENCODER"
-    MODE: str = "NATIVE_ENCODER"
+    # Mode selection: "E5-SYNTH", "E5-AVERAGE", or "NATIVE-ENCODER"
+    MODE: str = "NATIVE-ENCODER"
     # Chunking configuration
     CHUNK_N_LIST: List[int] = field(default_factory=lambda: [
                                     1, 2, 4, 8, 16])
@@ -219,6 +219,7 @@ class Config:
     # Inference settings
     ENCODE_BATCH_SIZE: int = 1  # Default for native (one query at a time)
     # Batch size for e5 chunk encoding within a single query
+    E5_MODEL_ID: str = "intfloat/multilingual-e5-base"
     E5_CHUNK_BATCH_SIZE: int = 1024
     USE_FP16: bool = True
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -401,7 +402,6 @@ def encode_texts_native_batch(texts: List[str], tokenizer, encoder, config: Conf
 
     return results
 
-
 def aggregate_chunks_e5(chunk_embs: np.ndarray, mode: str,
                         synthesizer=None, device: str = "cuda") -> np.ndarray:
     """Aggregate multiple chunk embeddings into a single document embedding."""
@@ -425,16 +425,13 @@ def aggregate_chunks_e5(chunk_embs: np.ndarray, mode: str,
             if chunk_batch.shape[1] > 512:
                 chunk_batch = chunk_batch[:, :512, :]
 
-            try:
-                model_dtype = next(synthesizer.parameters()).dtype
-                outputs = synthesizer(
-                    inputs_embeds=chunk_batch.to(model_dtype),
-                    attention_mask=torch.ones(
-                        chunk_batch.shape[:2], device=device)
-                )
-            except (TypeError, AttributeError):
-                model_dtype = next(synthesizer.parameters()).dtype
-                outputs = synthesizer(chunk_batch.to(model_dtype))
+            # Explicit attention_mask for clean interface compliance
+            model_dtype = next(synthesizer.parameters()).dtype
+            attention_mask = torch.ones(chunk_batch.shape[:2], device=device)
+            outputs = synthesizer(
+                inputs_embeds=chunk_batch.to(model_dtype),
+                attention_mask=attention_mask
+            )
 
             if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
                 agg_emb = outputs.pooler_output
@@ -634,6 +631,25 @@ def load_models(config: Config, model_id: str):
     encoder.eval()
     return tokenizer, encoder
 
+def load_e5_with_synthesizer(config: Config, model_id: str):
+    print(f"[load_models] MODE={config.MODE}, MODEL_ID={model_id}, DEVICE={config.DEVICE}")
+    dtype = torch.float16 if config.USE_FP16 else torch.float32
+    tokenizer = AutoTokenizer.from_pretrained(config.E5_MODEL_ID, trust_remote_code=True)
+    backbone = AutoModel.from_pretrained(config.E5_MODEL_ID, torch_dtype=dtype, trust_remote_code=True).to(config.DEVICE)
+    backbone.eval()
+    synth_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    synthesizer = AutoModel.from_pretrained(model_id, torch_dtype=dtype, config=synth_config, trust_remote_code=True).to(config.DEVICE)
+    synthesizer.eval()
+    return tokenizer, backbone, synthesizer
+
+def load_e5(config:Config):
+    print(f"[load_models] MODE={config.MODE}, MODEL_ID=(ignored), DEVICE={config.DEVICE}")
+    dtype = torch.float16 if config.USE_FP16 else torch.float32
+    tokenizer = AutoTokenizer.from_pretrained(config.E5_MODEL_ID, trust_remote_code=True)
+    backbone = AutoModel.from_pretrained(config.E5_MODEL_ID, torch_dtype=dtype, trust_remote_code=True).to(config.DEVICE)
+    backbone.eval()
+    return tokenizer, backbone
+
 # =============================================================================
 # REALISTIC RAG SIMULATION - E5 MODE (SYNTH & AVERAGE)
 # =============================================================================
@@ -646,7 +662,7 @@ def load_models(config: Config, model_id: str):
 # =============================================================================
 
 
-def build_indices_e5_mode(config: Config, model_id: str):
+def build_indices_e5_synth_mode(config: Config, model_id: str):
     """Build FAISS indices for E5-based modes with realistic RAG timing."""
     print(f"\n{'='*60}")
     print(f"Realistic RAG Simulation, Model: {model_id}")
@@ -657,7 +673,249 @@ def build_indices_e5_mode(config: Config, model_id: str):
     for dataset_name in config.DATASETS:
         print(f"\n{'-'*60}\nDataset: {dataset_name}\n{'-'*60}")
 
-        tokenizer, backbone, synthesizer = load_models(config, model_id)
+        tokenizer, backbone, synthesizer = load_e5_with_synthesizer(config, model_id)
+
+        # Warm-up
+        dummy_chunks = chunk_text_by_tokens(
+            "Warm-up dummy text for initialization.", tokenizer, config.TOKEN_CHUNK_SIZE)
+        dummy_embs = encode_texts_e5(dummy_chunks, backbone, tokenizer, config.E5_CHUNK_BATCH_SIZE,
+                                     instruction="passage", device=config.DEVICE)
+        _ = aggregate_chunks_e5(dummy_embs.cpu().numpy(),
+                                config.MODE, synthesizer, config.DEVICE)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        data_result = load_dataset_universal(dataset_name, config)
+        eval_format = data_result.get('eval_format', 'pairs')
+
+        if eval_format == 'pairs':
+            documents = data_result['documents']
+            doc_items = [{'id': doc['doc_id'], 'text': doc['doc_text']}
+                         for doc in documents]
+            query_items = [{'id': doc['abs_id'], 'text': doc['abs_text']}
+                           for doc in documents]
+        else:
+            doc_items = data_result['corpus']
+            query_items = data_result['queries']
+
+        # Determine qrels
+        if eval_format == 'pairs':
+            forward_qrels, reverse_qrels = None, None
+        else:
+            forward_qrels = data_result['qrels']
+            reverse_qrels = {}
+            for qid, doc_dict in forward_qrels.items():
+                for did in doc_dict.keys():
+                    reverse_qrels.setdefault(did, {})[qid] = 1
+
+        mode_suffix = config.MODE.lower().replace("-", "_")
+        model_suffix = model_id.replace('/', '_')
+        model_path = model_id.replace('/', '_')
+        forward_results = {}
+        reverse_results = {}
+
+        for chunk_n in config.CHUNK_N_LIST:
+            print(f"\n  CHUNK_N={chunk_n}")
+            max_len = chunk_n * config.TOKEN_CHUNK_SIZE if chunk_n != -1 else 512 * 100
+            chunk_suffix = f"c{chunk_n}" if chunk_n != -1 else "c_all"
+
+            # =================================================================
+            # Helper: encode + aggregate one text (for E5 modes)
+            # =================================================================
+            def encode_and_aggregate_e5(text: str) -> np.ndarray:
+                chunks = chunk_text_by_tokens(
+                    text, tokenizer, config.TOKEN_CHUNK_SIZE)
+                if not chunks:
+                    d = backbone.config.hidden_size
+                    return np.zeros(d, dtype='float32')
+                # Batch encode all chunks within this single query
+                chunk_embs = encode_texts_e5(chunks, backbone, tokenizer, config.E5_CHUNK_BATCH_SIZE,
+                                             instruction="passage", device=config.DEVICE)
+                chunk_embs = F.normalize(chunk_embs, p=2, dim=1)
+                # Single synthesizer call (or average)
+                return aggregate_chunks_e5(chunk_embs.cpu().numpy(), config.MODE, synthesizer, config.DEVICE)
+
+            # =================================================================
+            # FORWARD PASS
+            # =================================================================
+            print(f"    === FORWARD PASS ===")
+
+            # Phase 1: Truncation (outside timing)
+            fwd_trunc_docs = []
+            for item in doc_items:
+                tokens = tokenizer.encode(
+                    item['text'], add_special_tokens=False)[:max_len]
+                fwd_trunc_docs.append(tokenizer.decode(
+                    tokens, skip_special_tokens=True))
+
+            fwd_trunc_queries = []
+            for item in query_items:
+                tokens = tokenizer.encode(
+                    item['text'], add_special_tokens=False)[:max_len]
+                fwd_trunc_queries.append(tokenizer.decode(
+                    tokens, skip_special_tokens=True))
+
+            # Phase 2a: Document indexing (OUTSIDE timing - pre-indexed)
+            fwd_doc_embs = []
+            fwd_valid_doc_ids = []
+            for i, text in enumerate(fwd_trunc_docs):
+                emb = encode_and_aggregate_e5(text)
+                fwd_doc_embs.append(emb)
+                fwd_valid_doc_ids.append(doc_items[i]['id'])
+            fwd_doc_embs = np.stack(fwd_doc_embs, axis=0)
+
+            doc_index_path = os.path.join(
+                config.OUTPUT_DIR, f"{dataset_name}_doc_e5_{model_suffix}_{mode_suffix}_{chunk_suffix}.index")
+            fwd_doc_index = build_faiss_index(fwd_doc_embs, doc_index_path)
+
+            # Phase 2b: Query encoding (INSIDE timing - simulating real-time arrival)
+            fwd_query_embs = []
+            fwd_valid_query_ids = []
+            query_times = []
+
+            for i, text in enumerate(tqdm(fwd_trunc_queries, desc=f"      FWD queries (one-by-one)")):
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                start_t = time.monotonic()
+
+                emb = encode_and_aggregate_e5(text)
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                end_t = time.monotonic()
+
+                query_times.append((end_t - start_t) * 1000)
+                fwd_query_embs.append(emb)
+                fwd_valid_query_ids.append(query_items[i]['id'])
+
+            fwd_query_embs = np.stack(fwd_query_embs, axis=0)
+            total_query_time = sum(query_times)
+
+            # Evaluate
+            if eval_format == 'pairs':
+                fwd_evidence, fwd_metrics = evaluate_direction_pairs(
+                    fwd_doc_index, fwd_query_embs, query_times=query_times)
+            else:
+                fwd_evidence, fwd_metrics = evaluate_direction_mteb(
+                    fwd_doc_index, fwd_query_embs, fwd_valid_query_ids, fwd_valid_doc_ids, forward_qrels, query_times=query_times)
+
+            fwd_metrics['elapsed_time'] = total_query_time / 1000.0  # seconds
+            fwd_metrics['mean_query_latency_ms'] = np.mean(query_times)
+            fwd_metrics['median_query_latency_ms'] = np.median(query_times)
+            fwd_metrics['all_query_latencies_ms'] = query_times
+            forward_results[chunk_suffix] = fwd_metrics
+
+            save_evidence(fwd_evidence,
+                          {'dataset': dataset_name, 'direction': 'forward', 'mode': config.MODE,
+                           'model_id': model_id, 'chunk_n': chunk_n},
+                          os.path.join(config.OUTPUT_DIR, model_path),
+                          f"{dataset_name}_forward_e5_{model_suffix}_{mode_suffix}_{chunk_suffix}.json")
+
+            del fwd_doc_embs, fwd_query_embs, fwd_doc_index
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # =================================================================
+            # REVERSE PASS
+            # =================================================================
+            print(f"    === REVERSE PASS ===")
+
+            rev_trunc_docs = fwd_trunc_docs  # Same truncation
+            rev_trunc_queries = fwd_trunc_queries
+
+            # Phase 2a: Abstract/query indexing (OUTSIDE timing - pre-indexed as "documents")
+            rev_abs_embs = []
+            rev_valid_abs_ids = []
+            for i, text in enumerate(rev_trunc_queries):
+                emb = encode_and_aggregate_e5(text)
+                rev_abs_embs.append(emb)
+                rev_valid_abs_ids.append(query_items[i]['id'])
+            rev_abs_embs = np.stack(rev_abs_embs, axis=0)
+
+            abs_index_path = os.path.join(
+                config.OUTPUT_DIR, f"{dataset_name}_abs_e5_{model_suffix}_{mode_suffix}_{chunk_suffix}.index")
+            rev_abs_index = build_faiss_index(rev_abs_embs, abs_index_path)
+
+            # Phase 2b: Document-as-query encoding (INSIDE timing)
+            rev_doc_query_embs = []
+            rev_valid_doc_ids = []
+            rev_query_times = []
+
+            for i, text in enumerate(tqdm(rev_trunc_docs, desc=f"      REV queries (one-by-one)")):
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                start_t = time.monotonic()
+
+                emb = encode_and_aggregate_e5(text)
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                end_t = time.monotonic()
+
+                rev_query_times.append((end_t - start_t) * 1000)
+                rev_doc_query_embs.append(emb)
+                rev_valid_doc_ids.append(doc_items[i]['id'])
+
+            rev_doc_query_embs = np.stack(rev_doc_query_embs, axis=0)
+            rev_total_query_time = sum(rev_query_times)
+
+            # Evaluate
+            if eval_format == 'pairs':
+                rev_evidence, rev_metrics = evaluate_direction_pairs(
+                    rev_abs_index, rev_doc_query_embs, query_times=rev_query_times)
+            else:
+                rev_evidence, rev_metrics = evaluate_direction_mteb(
+                    rev_abs_index, rev_doc_query_embs, rev_valid_doc_ids, rev_valid_abs_ids, reverse_qrels, query_times=rev_query_times)
+
+            rev_metrics['elapsed_time'] = rev_total_query_time / 1000.0
+            rev_metrics['mean_query_latency_ms'] = np.mean(rev_query_times)
+            rev_metrics['median_query_latency_ms'] = np.median(rev_query_times)
+            rev_metrics['all_query_latencies_ms'] = rev_query_times
+            reverse_results[chunk_suffix] = rev_metrics
+
+            save_evidence(rev_evidence,
+                          {'dataset': dataset_name, 'direction': 'reverse', 'mode': config.MODE,
+                           'model_id': model_id, 'chunk_n': chunk_n},
+                          os.path.join(config.OUTPUT_DIR, model_path),
+                          f"{dataset_name}_reverse_e5_{model_suffix}_{mode_suffix}_{chunk_suffix}.json")
+
+            del rev_abs_embs, rev_doc_query_embs, rev_abs_index
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Save reports
+        save_report({'dataset': dataset_name, 'direction': 'forward', 'mode': config.MODE,
+                     'model_id': model_id, 'results': forward_results},
+                    os.path.join(config.OUTPUT_DIR, model_path), f"{dataset_name}_forward_report.json")
+        save_report({'dataset': dataset_name, 'direction': 'reverse', 'mode': config.MODE,
+                     'model_id': model_id, 'results': reverse_results},
+                    os.path.join(config.OUTPUT_DIR, model_path), f"{dataset_name}_reverse_report.json")
+
+    if synthesizer is not None:
+        del synthesizer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    print(f"\n{'='*60}\nE5 Mode Realistic RAG Simulation Complete!\n{'='*60}")
+
+
+def build_indices_e5_average_mode(config: Config):
+    """Build FAISS indices for E5-based modes with realistic RAG timing."""
+    print(f"\n{'='*60}")
+    print(f"Realistic RAG Simulation, Model: (ignored)")
+    print(f"{'='*60}")
+
+    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+
+    for dataset_name in config.DATASETS:
+        print(f"\n{'-'*60}\nDataset: {dataset_name}\n{'-'*60}")
+
+        tokenizer, backbone = load_e5(config)
+        synthesizer = None
+        model_id = 'average'
 
         # Warm-up
         dummy_chunks = chunk_text_by_tokens(
@@ -1039,7 +1297,7 @@ def build_indices_native_mode(config: Config, model_cfg: Dict[str, Any]):
             forward_results[chunk_suffix] = fwd_metrics
 
             save_evidence(fwd_evidence,
-                          {'dataset': dataset_name, 'direction': 'forward', 'mode': 'NATIVE_ENCODER',
+                          {'dataset': dataset_name, 'direction': 'forward', 'mode': 'NATIVE-ENCODER',
                            'model_id': model_id, 'chunk_n': chunk_n},
                           os.path.join(config.OUTPUT_DIR, model_path),
                           f"{dataset_name}_forward_native_{model_suffix}_{chunk_suffix}.json")
@@ -1124,7 +1382,7 @@ def build_indices_native_mode(config: Config, model_cfg: Dict[str, Any]):
             reverse_results[chunk_suffix] = rev_metrics
 
             save_evidence(rev_evidence,
-                          {'dataset': dataset_name, 'direction': 'reverse', 'mode': 'NATIVE_ENCODER',
+                          {'dataset': dataset_name, 'direction': 'reverse', 'mode': 'NATIVE-ENCODER',
                            'model_id': model_id, 'chunk_n': chunk_n},
                           os.path.join(config.OUTPUT_DIR, model_path),
                           f"{dataset_name}_reverse_native_{model_suffix}_{chunk_suffix}.json")
@@ -1134,10 +1392,10 @@ def build_indices_native_mode(config: Config, model_cfg: Dict[str, Any]):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        save_report({'dataset': dataset_name, 'direction': 'forward', 'mode': 'NATIVE_ENCODER',
+        save_report({'dataset': dataset_name, 'direction': 'forward', 'mode': 'NATIVE-ENCODER',
                      'model_id': model_id, 'results': forward_results},
                     os.path.join(config.OUTPUT_DIR, model_path), f"{dataset_name}_forward_report.json")
-        save_report({'dataset': dataset_name, 'direction': 'reverse', 'mode': 'NATIVE_ENCODER',
+        save_report({'dataset': dataset_name, 'direction': 'reverse', 'mode': 'NATIVE-ENCODER',
                      'model_id': model_id, 'results': reverse_results},
                     os.path.join(config.OUTPUT_DIR, model_path), f"{dataset_name}_reverse_report.json")
 
@@ -1198,38 +1456,59 @@ def main():
             # Instantiate the main config once
             config = Config()
 
-            # Autonomous mode will be work at NATIVE_ENCODER mode only.
-            config.mode = "NATIVE_ENCODER"
-            print(f"  MODE: {config.MODE}")
-            print(f"  DATASETS: {config.DATASETS}")
-            print(f"  DEVICE: {config.DEVICE}")
+            # Load model config first to determine mode
             with open(config_path, 'r', encoding='utf-8') as f:
                 model_cfg = json.load(f)
 
-            model_id = model_cfg["model_name"]
-            pool_type = model_cfg["pool_type"]
-            query_prefix = model_cfg["query_prefix"]
-            instructed_query = model_cfg["is_instruct"]
-            passage_prefix = model_cfg["passage_prefix"]
-            max_ctx = model_cfg["max_ctx"]
+            # Determine mode from config (default to NATIVE-ENCODER for backward compatibility)
+            detected_mode:str = model_cfg.get("mode", "NATIVE-ENCODER")
+            detected_mode = detected_mode.upper()
 
-            # Map keys from lemb config to a sffd-compatible config
-            sffd_model_cfg = {
-                "model_id": model_id,
-                "pool_type": pool_type,
-                "query_prefix": query_prefix,
-                "instructed_query": instructed_query,
-                "passage_prefix": passage_prefix,
-                "max_ctx": max_ctx,
-            }
+            if detected_mode == 'NATIVE-ENCODER' or detected_mode == 'E5-SYNTH' or detected_mode == 'E5-AVERAGE':
+                config.MODE = detected_mode
+            else:
+                raise Exception("Mode config must be one of : 'E5-SYNTH', 'E5-AVERAGE', or 'NATIVE-ENCODER'")
+            print(f"  MODE: {config.MODE}")
+            print(f"  DATASETS: {config.DATASETS}")
+            print(f"  DEVICE: {config.DEVICE}")
+
+
+            if config.MODE == "NATIVE-ENCODER":
+                model_id = model_cfg["model_name"]
+                pool_type = model_cfg["pool_type"]
+                query_prefix = model_cfg["query_prefix"]
+                instructed_query = model_cfg["is_instruct"]
+                passage_prefix = model_cfg["passage_prefix"]
+                max_ctx = model_cfg["max_ctx"]
+
+                # Map keys from lemb config to a sffd‑compatible config
+                sffd_model_cfg = {
+                    "model_id": model_id,
+                    "pool_type": pool_type,
+                    "query_prefix": query_prefix,
+                    "instructed_query": instructed_query,
+                    "passage_prefix": passage_prefix,
+                    "max_ctx": max_ctx,
+                }
+            elif config.MODE == "E5-SYNTH" or config.MODE == "E5-AVERAGE":
+                config.E5_MODEL_ID = model_cfg.get('e5_model_name', 'intfloat/multilingual-e5-base')
+
 
             # set output path to config path
             config.OUTPUT_DIR = config_path.parent
 
             start_time = time.monotonic()
 
-            # Run the original, complex evaluation function for this model
-            build_indices_native_mode(config, sffd_model_cfg)
+            # Run evaluation based on detected mode
+            if config.MODE == "E5-SYNTH":
+                model_id = model_cfg["model_name"]
+                build_indices_e5_synth_mode(config, model_id)
+            elif config.MODE == "E5-AVERAGE":
+                build_indices_e5_average_mode(config)
+            elif config.MODE == "NATIVE-ENCODER":
+                build_indices_native_mode(config, sffd_model_cfg)
+            else:
+                raise ValueError(f"Unknown mode: {config.MODE}. Supported modes: NATIVE-ENCODER, E5-SYNTH, E5-AVERAGE")
 
             end_time = time.monotonic()
 

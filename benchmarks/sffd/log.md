@@ -32,3 +32,14 @@ All model processed well on the experiments. Nothing special to record here.
 -   Final SFfD evaluation results are saved as,
     - `model_eval/model_eval_split_0.zip`
     - `model_eval/model_eval_split_1.zip`
+
+
+### 2026-04-04 : Additional Experiments Added
+
+We evaluated additional method.
+
+- `model_eval/model_eval_baseline.zip` : additional baseline model, which is the "chunk-embed-then-average" context extending strategy applied for the `intfloat/multilingual-e5-base` model.
+
+no model list changed. additional baseline model should NOT be treated as the single transformer model evaluation result.
+
+**evaluate_sffd_automate.py was modified for the baseline model evaluation.**

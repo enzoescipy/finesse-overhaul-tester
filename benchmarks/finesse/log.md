@@ -28,3 +28,16 @@ All model processed well on the experiments. Nothing special to record here.
     - `model_eval/model_eval_split_1.zip`
     - `model_eval/model_eval_split_2.zip`
     - `model_eval/model_eval_split_3.zip`
+
+
+### 2026-04-04 : Additional Experiments Added
+
+We evaluated additional method.
+
+- `additional_model_eval/cultura-en-l16-srs-weak.zip` : We did SRS(L=16), which was SRS(L=8).
+- `additional_model_eval/wikipedia-en-l15-rss.zip` : We changed dataset `CulturaX` to `Wikipedia` and evaluated only for RSS(L=15).
+- `model_eval/model_eval_baseline.zip` : additional baseline model, which is the "chunk-embed-then-average" context extending strategy applied for the `intfloat/multilingual-e5-base` model.
+
+no model list changed, but evaluation method was varied for those experiements.
+
+additional baseline model should NOT be treated as the single transformer model evaluation result.

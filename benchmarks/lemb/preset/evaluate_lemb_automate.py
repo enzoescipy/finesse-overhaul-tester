@@ -501,6 +501,516 @@ class ModelMTEBWrapper(SearchProtocol):
         print(
             f"[ModelWrapper] Loaded {self.model_name} with dim={self.output_dim}, max_ctx={self.max_ctx}")
 
+class SynthesizerMTEBWrapper(SearchProtocol):
+
+    def __init__(
+        self,
+        synthesizer_model_name: str,
+        e5_model_name: str = "intfloat/multilingual-e5-base",
+        e5_pool_type: str = "mean",
+        chunk_size: int = 512,
+        chunk_overlap: int = 0,
+        batch_size: int = 1,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        use_fp16: bool = True,
+        l2_norm: bool = True,
+        prefix_type: str = "passage_only",
+        max_input_tokens: int = 8190,
+    ):
+        self.e5_model_name = e5_model_name
+        self.synthesizer_model_name = synthesizer_model_name
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.batch_size = batch_size
+        self.device = device
+        self.use_fp16 = use_fp16
+        self.l2_norm = l2_norm
+        self.prefix_type = prefix_type
+        self.max_input_tokens = max_input_tokens
+
+        self.e5_pool_type = e5_pool_type
+
+        self.passage_prefix_len: int = 0
+        self.query_prefix_len: int = 0
+
+        self._load_e5_encoder()
+        self._load_synthesizer()
+        self.e5_encoder.eval()
+        self.synthesizer.eval()
+
+
+        self._faiss_index: Optional[faiss.Index] = None
+        self._corpus_ids: Optional[List[str]] = None  
+
+        self._mteb_model_meta: ModelMeta = get_model_meta(synthesizer_model_name)
+
+    @property
+    def mteb_model_meta(self) -> ModelMeta:
+        return self._mteb_model_meta
+
+    def index(
+        self,
+        corpus: CorpusDatasetType,
+        *,
+        task_metadata: TaskMetadata,
+        hf_split: str,
+        hf_subset: str,
+        encode_kwargs: EncodeKwargs,
+        num_proc: int | None,
+    ) -> None:
+        print(f"[SynthesizerWrapper] Indexing corpus (split={hf_split}, subset={hf_subset})...")
+
+        doc_ids, texts = self._extract_corpus_texts(corpus)
+        self._corpus_ids = doc_ids
+
+        embeddings = self._encode_texts(texts, is_query=False)  # [N, dim]
+
+        dim = embeddings.shape[1]
+        if self.l2_norm:
+            self._faiss_index = faiss.IndexFlatIP(dim)   # Inner Product
+        else:
+            self._faiss_index = faiss.IndexFlatL2(dim)   # L2 distance
+
+        self._faiss_index.add(embeddings.astype(np.float32))
+        print(f"[SynthesizerWrapper] Index built: {self._faiss_index.ntotal} vectors, dim={dim}")
+
+    def search(
+        self,
+        queries: QueryDatasetType,
+        *,
+        task_metadata: TaskMetadata,
+        hf_split: str,
+        hf_subset: str,
+        top_k: int,
+        encode_kwargs: EncodeKwargs,
+        top_ranked: TopRankedDocumentsType | None = None,
+        num_proc: int | None,
+    ) -> RetrievalOutputType:
+        if self._faiss_index is None or self._corpus_ids is None:
+            raise RuntimeError("index() must be called before search().")
+
+        print(f"[SynthesizerWrapper] Searching queries (split={hf_split}, top_k={top_k})...")
+
+        query_ids, query_texts = self._extract_query_texts(queries)
+        query_embeddings = self._encode_texts(query_texts, is_query=True)  # [Q, dim]
+
+        scores, indices = self._faiss_index.search(
+            query_embeddings.astype(np.float32), top_k
+        )  # [Q, top_k]
+
+        results: RetrievalOutputType = {}
+        for q_idx, q_id in enumerate(query_ids):
+            results[q_id] = {
+                self._corpus_ids[doc_idx]: float(scores[q_idx, rank])
+                for rank, doc_idx in enumerate(indices[q_idx])
+                if doc_idx != -1  
+            }
+
+        return results
+
+    def _extract_corpus_texts(self, corpus) -> tuple[List[str], List[str]]:
+        doc_ids, texts = [], []
+
+        if isinstance(corpus, dict):
+            for doc_id, doc in corpus.items():
+                title = doc.get("title", "")
+                text = doc.get("text", "")
+                combined = f"{title} {text}".strip() if title else text
+                doc_ids.append(str(doc_id))
+                texts.append(combined)
+        else:
+            for row in corpus:
+                doc_id = str(row.get("_id", row.get("id", "")))
+                title = row.get("title", "")
+                text = row.get("text", "")
+                combined = f"{title} {text}".strip() if title else text
+                doc_ids.append(doc_id)
+                texts.append(combined)
+
+        return doc_ids, texts
+
+    def _extract_query_texts(self, queries) -> tuple[List[str], List[str]]:
+        query_ids, texts = [], []
+
+        if isinstance(queries, dict):
+            for q_id, q_text in queries.items():
+                query_ids.append(str(q_id))
+                texts.append(q_text if isinstance(q_text, str) else q_text.get("text", ""))
+        else:
+            for row in queries:
+                q_id = str(row.get("_id", row.get("id", "")))
+                text = row.get("text", row.get("query", ""))
+                query_ids.append(q_id)
+                texts.append(text)
+
+        return query_ids, texts
+
+
+    def _encode_texts(self, texts: List[str], is_query: bool) -> np.ndarray:
+        embeddings = []
+        for text in tqdm(texts, desc="Encoding queries" if is_query else "Encoding corpus"):
+            chunks = self._chunk_text(text, is_query=is_query)
+            chunk_embs = self._encode_chunks(chunks, is_query=is_query)
+            final_emb = self._synthesize(chunk_embs)
+            embeddings.append(final_emb)
+        return np.stack(embeddings, axis=0)
+
+    def _load_e5_encoder(self):
+        print(f"[SynthesizerWrapper] Loading E5 encoder: {self.e5_model_name}")
+        self.e5_tokenizer = AutoTokenizer.from_pretrained(self.e5_model_name, trust_remote_code=True)
+        dtype = torch.float16 if self.use_fp16 else torch.float32
+        self.e5_encoder = AutoModel.from_pretrained(
+            self.e5_model_name, torch_dtype=dtype, trust_remote_code=True
+        ).to(self.device)
+        self.e5_dim = self.e5_encoder.config.hidden_size
+
+        # Calculate actual prefix token lengths
+        self.passage_prefix_len = len(self.e5_tokenizer.encode("passage: ", add_special_tokens=False))
+        self.query_prefix_len = len(self.e5_tokenizer.encode("query: ", add_special_tokens=False))
+        print(f"[SynthesizerWrapper] Prefix lengths - passage: {self.passage_prefix_len}, query: {self.query_prefix_len}")
+
+
+    def _load_synthesizer(self):
+        print(f"[SynthesizerWrapper] Loading : {self.synthesizer_model_name}")
+        dtype = torch.float16 if self.use_fp16 else torch.float32
+        config = AutoConfig.from_pretrained(self.synthesizer_model_name, trust_remote_code=True)
+        self.synthesizer = AutoModel.from_pretrained(
+            self.synthesizer_model_name, torch_dtype=dtype, config=config, trust_remote_code=True
+        ).to(self.device)
+        self.output_dim = getattr(config, "hidden_size", self.e5_dim)
+
+
+    def _chunk_text(self, text: str, is_query: bool = False) -> List[str]:
+        # Determine correct prefix length based on query/passage
+        if self.prefix_type == "query_or_passage":
+            prefix_len = self.query_prefix_len if is_query else self.passage_prefix_len
+        elif self.prefix_type == "passage_only":
+            prefix_len = self.passage_prefix_len
+        else:
+            prefix_len = 0
+    
+        # Calculate effective chunk size (accounting for prefix)
+        effective_chunk_size = self.chunk_size - prefix_len
+        if effective_chunk_size <= 0:
+            raise ValueError(f"chunk_size ({self.chunk_size}) must be larger than prefix_len ({prefix_len})")
+    
+        # Truncate input text based on max_input_tokens
+        total_tokens = self.e5_tokenizer.encode(text, add_special_tokens=False)
+        if len(total_tokens) > self.max_input_tokens:
+            total_tokens = total_tokens[:self.max_input_tokens]
+
+        chunks = []
+        start_idx = 0
+
+        while start_idx < len(total_tokens):
+            # Get chunk tokens using effective size
+            end_idx = min(start_idx + effective_chunk_size, len(total_tokens))
+            chunk_tokens = total_tokens[start_idx:end_idx]
+    
+            # Decode chunk back to text
+            chunk_text = self.e5_tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+            chunks.append(chunk_text)
+    
+            # Move start index forward by (effective_chunk_size - overlap)
+            start_idx += effective_chunk_size - self.chunk_overlap
+    
+            # Prevent infinite loop if overlap >= effective_chunk_size
+            if self.chunk_overlap >= effective_chunk_size:
+                break
+
+        return chunks
+
+    def _encode_chunks(self, chunks: List[str], is_query: bool = False) -> np.ndarray:
+        if self.prefix_type == "query_or_passage":
+            prefix = "query: " if is_query else "passage: "
+        if self.prefix_type == "passage_only":
+            prefix = "passage: "
+        chunks = [prefix + c for c in chunks]
+        embeddings = []
+        with torch.no_grad():
+            for i in range(0, len(chunks), self.batch_size):
+                batch = chunks[i:i + self.batch_size]
+                inputs = self.e5_tokenizer(
+                    batch, padding=True, truncation=True,
+                    max_length=self.chunk_size, return_tensors="pt"
+                ).to(self.device)
+                with torch.cuda.amp.autocast(enabled=self.use_fp16):
+                    outputs = self.e5_encoder(**inputs)
+                    if self.e5_pool_type == "mean":
+                        mask = inputs["attention_mask"].unsqueeze(-1).float()
+                        emb = (outputs.last_hidden_state * mask).sum(1) / mask.sum(1).clamp(1e-9)
+                    elif self.e5_pool_type == "cls":
+                        emb = outputs.last_hidden_state[:, 0]
+                    else:
+                        seqlens = inputs["attention_mask"].sum(1) - 1
+                        emb = outputs.last_hidden_state[range(len(batch)), seqlens]
+                embeddings.append(emb.cpu().float().numpy())
+        return np.concatenate(embeddings, axis=0)
+
+
+    def _synthesize(self, chunk_embeddings: np.ndarray) -> np.ndarray:
+        # Truncate to synthesizer's sequence limit (512 chunks max)
+        if chunk_embeddings.shape[0] > 512:
+            chunk_embeddings = chunk_embeddings[:512]
+    
+        chunk_tensor = torch.from_numpy(chunk_embeddings).to(self.device).unsqueeze(0)
+
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(enabled=self.use_fp16):
+                outputs = self.synthesizer(
+                    inputs_embeds=chunk_tensor,
+                    attention_mask=torch.ones(chunk_tensor.shape[:2], device=self.device)
+                )
+                final = outputs.pooler_output
+                if self.l2_norm:
+                    final = torch.nn.functional.normalize(final, p=2, dim=-1)
+        return final.squeeze(0).cpu().float().numpy()
+
+class AverageMTEBWrapper(SearchProtocol):
+
+    def __init__(
+        self,
+        e5_model_name: str = "intfloat/multilingual-e5-base",
+        pool_type: str = "mean",
+        chunk_size: int = 512,
+        chunk_overlap: int = 0,
+        batch_size: int = 1,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        use_fp16: bool = True,
+        l2_norm: bool = True,
+        prefix_type: str = "passage_only",
+        max_input_tokens: int = 8190,
+    ):
+        self.e5_model_name = e5_model_name
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.batch_size = batch_size
+        self.device = device
+        self.use_fp16 = use_fp16
+        self.l2_norm = l2_norm
+        self.prefix_type = prefix_type
+        self.max_input_tokens = max_input_tokens
+
+        self.pool_type = pool_type
+
+        self.passage_prefix_len: int = 0
+        self.query_prefix_len: int = 0
+
+        self._load_e5_encoder()
+        self.e5_encoder.eval()
+
+        self._faiss_index: Optional[faiss.Index] = None
+        self._corpus_ids: Optional[List[str]] = None  
+
+    @property
+    def mteb_model_meta(self) -> ModelMeta:
+        return get_model_meta(self.e5_model_name)
+
+    def index(
+        self,
+        corpus: CorpusDatasetType,
+        *,
+        task_metadata: TaskMetadata,
+        hf_split: str,
+        hf_subset: str,
+        encode_kwargs: EncodeKwargs,
+        num_proc: int | None,
+    ) -> None:
+        print(f"[AverageWrapper] Indexing corpus (split={hf_split}, subset={hf_subset})...")
+
+        doc_ids, texts = self._extract_corpus_texts(corpus)
+        self._corpus_ids = doc_ids
+
+        embeddings = self._encode_texts(texts, is_query=False)  # [N, dim]
+
+        dim = embeddings.shape[1]
+        if self.l2_norm:
+            self._faiss_index = faiss.IndexFlatIP(dim)   # Inner Product
+        else:
+            self._faiss_index = faiss.IndexFlatL2(dim)   # L2 distance
+
+        self._faiss_index.add(embeddings.astype(np.float32))
+        print(f"[AverageWrapper] Index built: {self._faiss_index.ntotal} vectors, dim={dim}")
+
+    def search(
+        self,
+        queries: QueryDatasetType,
+        *,
+        task_metadata: TaskMetadata,
+        hf_split: str,
+        hf_subset: str,
+        top_k: int,
+        encode_kwargs: EncodeKwargs,
+        top_ranked: TopRankedDocumentsType | None = None,
+        num_proc: int | None,
+    ) -> RetrievalOutputType:
+        if self._faiss_index is None or self._corpus_ids is None:
+            raise RuntimeError("index() must be called before search().")
+
+        print(f"[AverageWrapper] Searching queries (split={hf_split}, top_k={top_k})...")
+
+        query_ids, query_texts = self._extract_query_texts(queries)
+        query_embeddings = self._encode_texts(query_texts, is_query=True)  # [Q, dim]
+
+        scores, indices = self._faiss_index.search(
+            query_embeddings.astype(np.float32), top_k
+        )  # [Q, top_k]
+
+        results: RetrievalOutputType = {}
+        for q_idx, q_id in enumerate(query_ids):
+            results[q_id] = {
+                self._corpus_ids[doc_idx]: float(scores[q_idx, rank])
+                for rank, doc_idx in enumerate(indices[q_idx])
+                if doc_idx != -1 
+            }
+
+        return results
+
+    def _extract_corpus_texts(self, corpus) -> tuple[List[str], List[str]]:
+        doc_ids, texts = [], []
+
+        if isinstance(corpus, dict):
+            for doc_id, doc in corpus.items():
+                title = doc.get("title", "")
+                text = doc.get("text", "")
+                combined = f"{title} {text}".strip() if title else text
+                doc_ids.append(str(doc_id))
+                texts.append(combined)
+        else:
+            for row in corpus:
+                doc_id = str(row.get("_id", row.get("id", "")))
+                title = row.get("title", "")
+                text = row.get("text", "")
+                combined = f"{title} {text}".strip() if title else text
+                doc_ids.append(doc_id)
+                texts.append(combined)
+
+        return doc_ids, texts
+
+    def _extract_query_texts(self, queries) -> tuple[List[str], List[str]]:
+        query_ids, texts = [], []
+
+        if isinstance(queries, dict):
+            for q_id, q_text in queries.items():
+                query_ids.append(str(q_id))
+                texts.append(q_text if isinstance(q_text, str) else q_text.get("text", ""))
+        else:
+            for row in queries:
+                q_id = str(row.get("_id", row.get("id", "")))
+                text = row.get("text", row.get("query", ""))
+                query_ids.append(q_id)
+                texts.append(text)
+
+        return query_ids, texts
+
+    def _encode_texts(self, texts: List[str], is_query: bool) -> np.ndarray:
+        embeddings = []
+        for text in tqdm(texts, desc="Encoding queries" if is_query else "Encoding corpus"):
+            chunks = self._chunk_text(text, is_query=is_query)
+            chunk_embs = self._encode_chunks(chunks, is_query=is_query)
+            final_emb = self._synthesize_with_average(chunk_embs)
+            embeddings.append(final_emb)
+        return np.stack(embeddings, axis=0)
+
+
+    def _load_e5_encoder(self):
+        print(f"[AverageWrapper] Loading E5 encoder: {self.e5_model_name}")
+        self.e5_tokenizer = AutoTokenizer.from_pretrained(self.e5_model_name, trust_remote_code=True)
+        dtype = torch.float16 if self.use_fp16 else torch.float32
+        self.e5_encoder = AutoModel.from_pretrained(
+            self.e5_model_name, torch_dtype=dtype, trust_remote_code=True
+        ).to(self.device)
+        self.e5_dim = self.e5_encoder.config.hidden_size
+
+        # Calculate actual prefix token lengths
+        self.passage_prefix_len = len(self.e5_tokenizer.encode("passage: ", add_special_tokens=False))
+        self.query_prefix_len = len(self.e5_tokenizer.encode("query: ", add_special_tokens=False))
+        print(f"[AverageWrapper] Prefix lengths - passage: {self.passage_prefix_len}, query: {self.query_prefix_len}")
+    def _chunk_text(self, text: str, is_query: bool = False) -> List[str]:
+        """
+        Naive fixed-length chunking using only e5_tokenizer.
+        Splits text into chunks of effective_chunk_size tokens with overlap.
+        Accounts for prefix length to prevent data truncation.
+        """
+        # Determine correct prefix length based on query/passage
+        if self.prefix_type == "query_or_passage":
+            prefix_len = self.query_prefix_len if is_query else self.passage_prefix_len
+        elif self.prefix_type == "passage_only":
+            prefix_len = self.passage_prefix_len
+        else:
+            prefix_len = 0
+    
+        # Calculate effective chunk size (accounting for prefix)
+        effective_chunk_size = self.chunk_size - prefix_len
+        if effective_chunk_size <= 0:
+            raise ValueError(f"chunk_size ({self.chunk_size}) must be larger than prefix_len ({prefix_len})")
+    
+        # Truncate input text based on max_input_tokens
+        total_tokens = self.e5_tokenizer.encode(text, add_special_tokens=False)
+        if len(total_tokens) > self.max_input_tokens:
+            total_tokens = total_tokens[:self.max_input_tokens]
+
+        chunks = []
+        start_idx = 0
+
+        while start_idx < len(total_tokens):
+            # Get chunk tokens using effective size
+            end_idx = min(start_idx + effective_chunk_size, len(total_tokens))
+            chunk_tokens = total_tokens[start_idx:end_idx]
+    
+            # Decode chunk back to text
+            chunk_text = self.e5_tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+            chunks.append(chunk_text)
+    
+            # Move start index forward by (effective_chunk_size - overlap)
+            start_idx += effective_chunk_size - self.chunk_overlap
+    
+            # Prevent infinite loop if overlap >= effective_chunk_size
+            if self.chunk_overlap >= effective_chunk_size:
+                break
+
+        return chunks
+
+    def _encode_chunks(self, chunks: List[str], is_query: bool = False) -> np.ndarray:
+        if self.prefix_type == "query_or_passage":
+            prefix = "query: " if is_query else "passage: "
+        if self.prefix_type == "passage_only":
+            prefix = "passage: "
+        chunks = [prefix + c for c in chunks]
+        embeddings = []
+        with torch.no_grad():
+            for i in range(0, len(chunks), self.batch_size):
+                batch = chunks[i:i + self.batch_size]
+                inputs = self.e5_tokenizer(
+                    batch, padding=True, truncation=True,
+                    max_length=self.chunk_size, return_tensors="pt"
+                ).to(self.device)
+                with torch.cuda.amp.autocast(enabled=self.use_fp16):
+                    outputs = self.e5_encoder(**inputs)
+                    if self.pool_type == "mean":
+                        mask = inputs["attention_mask"].unsqueeze(-1).float()
+                        emb = (outputs.last_hidden_state * mask).sum(1) / mask.sum(1).clamp(1e-9)
+                    elif self.pool_type == "cls":
+                        emb = outputs.last_hidden_state[:, 0]
+                    else:
+                        seqlens = inputs["attention_mask"].sum(1) - 1
+                        emb = outputs.last_hidden_state[range(len(batch)), seqlens]
+                embeddings.append(emb.cpu().float().numpy())
+        return np.concatenate(embeddings, axis=0)
+
+    def _synthesize_with_average(self, chunk_embeddings: np.ndarray) -> np.ndarray:
+        # Simple mean pooling across all chunks
+        final_emb = np.mean(chunk_embeddings, axis=0)
+
+        if self.l2_norm:
+            # L2 normalize the final vector
+            norm = np.linalg.norm(final_emb)
+            if norm > 0:
+                final_emb = final_emb / norm
+
+        return final_emb
+
+
 # ================================================================== #
 #  Automated Batch Evaluation                                          #
 # ================================================================== #
@@ -525,30 +1035,55 @@ NEEDLE_PASSKEY_TASKS = ["LEMBNeedleRetrieval", "LEMBPasskeyRetrieval"]
 RETRIEVAL_TASKS = ["LEMBSummScreenFDRetrieval", "LEMBQMSumRetrieval",
                    "LEMBWikimQARetrieval", "LEMBNarrativeQARetrieval"]
 
-
 def evaluate_single_model(config_path: str, output_dir: str):
     """Load config.json, build model, run full LongEmbed evaluation, save results."""
     with open(config_path, 'r') as f:
         config = json.load(f)
-
     model_name = config['model_name']
-    query_prefix = config['query_prefix']
-    passage_prefix = config['passage_prefix']
-    max_ctx = config['max_ctx']
-    pool_type = config['pool_type']
-    batch_size = config['batch_size']
-    # If query_prefix is empty, follow LongEmbed protocol with INSTRUCT_PROMPT
-    if not query_prefix:
-        query_prefix = INSTRUCT_PROMPT
 
-    model = ModelMTEBWrapper(
-        model_name=model_name,
-        query_prefix=query_prefix,
-        passage_prefix=passage_prefix,
-        max_ctx=max_ctx,
-        pool_type=pool_type,
-        batch_size=batch_size,
-    )
+    # Dynamically select the appropriate wrapper based on config
+    # Mode selection: "E5-SYNTH", "E5-AVERAGE", or "NATIVE-ENCODER"
+    detected_mode:str = config.get('mode', 'NATIVE-ENCODER')
+    detected_mode = detected_mode.upper()
+    if detected_mode == 'NATIVE-ENCODER' or detected_mode == 'E5-SYNTH' or detected_mode == 'E5-AVERAGE':
+        pass
+    else:
+        raise Exception("Mode config must be one of : 'E5-SYNTH', 'E5-AVERAGE', or 'NATIVE-ENCODER'")
+
+    if detected_mode == 'E5-SYNTH':
+        # Synthesizer mode: use E5 + Synthesizer pipeline
+        print(f"  [LEMB] Detected Synth configuration: {config['model_name']}")
+        model = SynthesizerMTEBWrapper(
+            synthesizer_model_name=config['model_name'],
+            e5_model_name=config.get('e5_model_name', 'intfloat/multilingual-e5-base'),
+        )
+    elif detected_mode == 'E5-AVERAGE':
+        # Average mode: use E5 + Average pooling pipeline
+        print(f"  [LEMB] Detected Average configuration: ignore model name")
+        model = AverageMTEBWrapper(
+            e5_model_name=config.get('e5_model_name', 'intfloat/multilingual-e5-base'),
+        )     
+    else:
+        # Standard mode: use single encoder
+        model_name = config['model_name']
+        query_prefix = config['query_prefix']
+        passage_prefix = config['passage_prefix']
+        max_ctx = config['max_ctx']
+        pool_type = config['pool_type']
+        batch_size = config['batch_size']
+        # If query_prefix is empty, follow LongEmbed protocol with INSTRUCT_PROMPT
+        if not query_prefix:
+            query_prefix = INSTRUCT_PROMPT
+
+        print(f"  [LEMB] Detected Native configuration: {config['model_name']}")
+        model = ModelMTEBWrapper(
+            model_name=model_name,
+            query_prefix=query_prefix,
+            passage_prefix=passage_prefix,
+            max_ctx=max_ctx,
+            pool_type=pool_type,
+            batch_size=batch_size,
+        )
 
     output_dict = {}
 

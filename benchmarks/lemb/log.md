@@ -158,3 +158,15 @@ In our test environment, they produce serious unknown CUDA "*CUDA error: device-
 -   The revised list of models and the configuration is saved as `investigation-verified.csv`.
 -   Final LEMB evaluation results (including excluded models) are saved as `model_eval_2.zip`.
 -   This `log.md` and `investigation-verified.csv` is copied to the `model-selection/model-verify-lemb-log` folder.
+
+
+### 2026-04-04 : Additional Experiments Added
+
+We evaluated additional method.
+
+- `model_eval/model_eval_baseline.zip` : additional baseline model, which is the "chunk-embed-then-average" context extending strategy applied for the `intfloat/multilingual-e5-base` model.
+- `model_eval/model_eval.zip` : this is copy of the `model_eval_2.zip`.
+
+no model list changed. additional baseline model should NOT be treated as the single transformer model evaluation result.
+
+**evaluate_lemb_automate.py was modified for the baseline model evaluation.**
